@@ -9,6 +9,9 @@
 
 // --- DINA UPPGIFTER ---
 #include "secrets.h"
+// Se till att din secrets.h ser ut såhär inuti:
+// const char *ssid = "DITT_WIFI_NAMN";
+// const char *password = "DITT_LÖSENORD";
 
 // SL Transport API (gratis, ingen nyckel behövs)
 // Stora Lappkärrsberget = SiteId 1182
@@ -42,7 +45,7 @@ void setup() {
   display.println("Ansluter WiFi...");
   display.display();
 
-  // Starta WiFi
+  // Starta WiFi (använder variablerna från secrets.h)
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -75,7 +78,7 @@ void loop() {
   if (timeinfo.tm_hour >= 22 || timeinfo.tm_hour < 6) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     Serial.println("Nattläge aktivt. Skärm avstängd.");
-    delay(10 * 60000UL);
+    delay(10 * 60000UL); // Vila 10 minuter, ingen API-trafik
     return;
   }
 
@@ -89,54 +92,40 @@ void loop() {
     return;
   }
 
-  // Uppdatera temperaturen var 30:e minut
+  // Uppdatera temperaturen var 30:e minut (sparar data/trafik)
   if (millis() - lastTempUpdate > 30 * 60000UL || lastTempUpdate == 0) {
     currentTemp = getTemperature();
     lastTempUpdate = millis();
   }
 
-  // Hämta avgångar och få tillbaka hur många minuter det är kvar
+  // Hämta avgångar. Returnerar -1 om ingen buss hittades.
   int minutesLeft = getDepartureData();
 
-  // --- SMART DELAY-LOGIK ---
-  unsigned long delayMs;
-
-  if (minutesLeft == -1) {
-    // Ingen buss hittades -> Vila 30 minuter
-    delayMs = 30 * 60000UL;
-    Serial.println("Ingen buss. Väntar 30 minuter.");
-  } else if (minutesLeft <= 5) {
-    // Bussen går inom 5 minuter -> Live-uppdatering var 30:e sekund
-    delayMs = 30 * 1000UL;
-    Serial.println("Live-läge! Uppdaterar om 30 sekunder.");
-  } else {
-    // Sov tills det är exakt 5 minuter kvar. Max vila 30 min.
-    int sleepMins = minutesLeft - 5;
-    if (sleepMins > 30)
-      sleepMins = 30;
-
-    delayMs = sleepMins * 60000UL;
+  // --- UPPDATERA ALLTID VARJE MINUT PÅ DAGTID ---
+  if (minutesLeft != -1) {
     Serial.print("Bussen går om ");
     Serial.print(minutesLeft);
-    Serial.print(" min. Sover i ");
-    Serial.print(sleepMins);
     Serial.println(" min.");
+  } else {
+    // Visas bara i seriell monitor, ej skärmen.
+    Serial.println("Kunde inte hämta bussdata (försöker igen om 1 min).");
   }
 
-  delay(delayMs);
+  Serial.println("Uppdaterar om 1 minut...");
+  delay(60000UL); // Vänta exakt 1 minut
 }
 
 // Returnerar antal minuter kvar. Returnerar -1 om ingen buss hittades.
 int getDepartureData() {
   HTTPClient http;
 
-  // SL Transport API - inga nycklar behövs!
+  // SL Transport API
   String url = "https://transport.integration.sl.se/v1/sites/";
   url += slSiteId;
   url += "/departures";
 
   http.useHTTP10(true);
-  http.begin(url); // Vanlig HTTP, inget SSL behövs
+  http.begin(url);
   int httpCode = http.GET();
 
   int minutesLeftToReturn = -1;
@@ -148,7 +137,6 @@ int getDepartureData() {
     filter["departures"][0]["destination"] = true;
     filter["departures"][0]["scheduled"] = true;
     filter["departures"][0]["expected"] = true;
-    filter["departures"][0]["display"] = true;
 
     DynamicJsonDocument doc(8192);
     DeserializationError error = deserializeJson(
@@ -162,14 +150,12 @@ int getDepartureData() {
     }
 
     if (!doc["departures"].is<JsonArray>()) {
-      displayNoBus();
       http.end();
       return -1;
     }
 
     JsonArray departures = doc["departures"];
     bool found = false;
-    int busDelayMins = 0;
 
     struct tm timeinfo;
     getLocalTime(&timeinfo);
@@ -179,36 +165,18 @@ int getDepartureData() {
       String line = dep["line"]["designation"].as<String>();
       String dest = dep["destination"].as<String>();
 
-      // Buss 50 mot Odenplan eller Universitetet (INTE mot Lappkärrsberget)
-      if (line == "50" &&
-          dest.indexOf("Lappk") == -1) {
+      // Buss 50 mot Odenplan/Universitetet
+      if (line == "50" && dest.indexOf("Lappk") == -1) {
+        String useTime = dep["expected"] ? dep["expected"].as<String>()
+                                         : dep["scheduled"].as<String>();
 
-        // "expected" = realtid, "scheduled" = tidtabell
-        // "display" = text som "5 min" eller "Nu"
-        String expectedStr = dep["expected"] ? dep["expected"].as<String>() : "";
-        String scheduledStr = dep["scheduled"] ? dep["scheduled"].as<String>() : "";
+        if (useTime.length() < 16)
+          continue;
 
-        // Använd realtid om den finns, annars tidtabell
-        // Format: "2026-05-17T08:35:00"
-        String useTime = expectedStr.length() > 0 ? expectedStr : scheduledStr;
-        
-        if (useTime.length() < 16) continue; // Ogiltig tid
-
-        // Plocka ut HH:MM från "YYYY-MM-DDTHH:MM:SS"
         int busH = useTime.substring(11, 13).toInt();
         int busM = useTime.substring(14, 16).toInt();
         int busTotalMins = (busH * 60) + busM;
 
-        // Beräkna försening
-        if (expectedStr.length() > 0 && scheduledStr.length() > 0) {
-          int schedH = scheduledStr.substring(11, 13).toInt();
-          int schedM = scheduledStr.substring(14, 16).toInt();
-          int schedTotalMins = (schedH * 60) + schedM;
-          busDelayMins = busTotalMins - schedTotalMins;
-          if (busDelayMins < 0) busDelayMins = 0;
-        }
-
-        // Hantera midnatt
         if (busTotalMins < currentTotalMins &&
             (currentTotalMins - busTotalMins) > 1000) {
           busTotalMins += 24 * 60;
@@ -219,7 +187,7 @@ int getDepartureData() {
         if (diff >= 0) {
           minutesLeftToReturn = diff;
           found = true;
-          break;
+          break; // Hittat nästa buss, sluta leta
         }
       }
     }
@@ -228,92 +196,76 @@ int getDepartureData() {
     display.clearDisplay();
     display.setTextColor(WHITE);
 
-    if (found) {
-      // Stora siffror för minuter kvar
-      display.setTextSize(7);
+    // 1. Rita temperatur i övre högra hörnet först (Större + °)
+    if (currentTemp != -99.0) {
+      int tempInt = (int)round(currentTemp);
+      display.setTextSize(3);
 
-      if (minutesLeftToReturn < 10) {
-        display.setCursor(20, 0);
+      if (tempInt > -10 && tempInt < 10) {
+        display.setCursor(85, 0);
       } else {
-        display.setCursor(0, 0);
+        display.setCursor(67, 0);
       }
 
-      display.print(minutesLeftToReturn);
-
-      // Visa försening om bussen är sen och nära
-      if (busDelayMins > 0 && minutesLeftToReturn <= 10) {
-        display.setTextSize(1);
-        display.setCursor(86, 20);
-        display.print("+");
-        display.print(busDelayMins);
-        display.print(" sen");
-      }
-    } else {
-      display.setTextSize(2);
-      display.setCursor(0, 24);
-      display.print("Ingen buss");
+      display.print(tempInt);
+      display.print("\xF7");
     }
 
-    // Rita temperatur i övre högra hörnet (visas alltid)
-    if (currentTemp != -99.0) {
+    // 2. Rita busstid (Alltid störst)
+    display.setTextSize(7);
+    if (found) {
+      if (minutesLeftToReturn < 10) {
+        display.setCursor(20, 8);
+      } else {
+        display.setCursor(0, 8);
+      }
+      display.print(minutesLeftToReturn);
+    } else {
       display.setTextSize(2);
-      display.setCursor(86, 0);
-      display.print((int)round(currentTemp));
-      display.print("C");
+      display.setCursor(0, 30);
+      display.print("Ingen buss");
     }
 
     display.display();
 
   } else {
-    Serial.print("HTTP Error: ");
+    Serial.print("HTTP Error SL: ");
     Serial.println(httpCode);
-
-    display.clearDisplay();
-    display.setTextColor(WHITE);
-    display.setCursor(0, 10);
-    display.setTextSize(1);
-    display.println("API-fel:");
-    display.setCursor(0, 25);
-    display.setTextSize(2);
-    display.print("HTTP ");
-    display.println(httpCode);
-    display.display();
   }
 
   http.end();
   return minutesLeftToReturn;
 }
 
-// Hjälpfunktion för att rita "Ingen buss"
-void displayNoBus() {
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setTextSize(3);
-  display.setCursor(18, 20);
-  display.print("Ingen");
-  display.display();
-}
-
+// Temperatur-API
 float getTemperature() {
   HTTPClient http;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=59.3294&longitude=18.0687&current=temperature_2m";
-  
+  // Stockholm (Du kan ändra lat/long till Lappkärrsberget om du
+  // vill: 59.367, 18.064)
+  String url =
+      "https://api.open-meteo.com/v1/"
+      "forecast?latitude=59.3294&longitude=18.0687&current=temperature_2m";
+
   WiFiClientSecure clientSecure;
   clientSecure.setInsecure();
-  
+
   http.useHTTP10(true);
   http.begin(clientSecure, url);
   int httpCode = http.GET();
   float temp = -99.0;
-  
+
   if (httpCode == 200) {
     StaticJsonDocument<128> filter;
     filter["current"]["temperature_2m"] = true;
     DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    DeserializationError error = deserializeJson(
+        doc, http.getStream(), DeserializationOption::Filter(filter));
     if (!error) {
       temp = doc["current"]["temperature_2m"].as<float>();
     }
+  } else {
+    Serial.print("HTTP Error Väder: ");
+    Serial.println(httpCode);
   }
   http.end();
   return temp;
